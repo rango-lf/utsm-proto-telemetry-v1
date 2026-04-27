@@ -31,12 +31,13 @@ if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
 from utsm_telemetry import (
+    FORWARD_AXIS_CHOICES,
     read_gpx,
     read_telemetry,
     align_telemetry,
     find_start_spike,
     find_nearest_gps_index,
-    find_lap_boundaries_by_y_crossing,
+    find_lap_boundaries_by_start_gate,
     split_gps_into_laps,
     merge_by_time,
     derive_motion_energy,
@@ -83,6 +84,51 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tolerance-sec", type=float, default=1.5,
         help="Max seconds tolerance for GPS/telemetry time merge",
+    )
+    parser.add_argument(
+        "--forward-axis",
+        choices=FORWARD_AXIS_CHOICES,
+        default="ax",
+        help=(
+            "Legacy IMU axis alias retained for older scripts."
+        ),
+    )
+    parser.add_argument(
+        "--accel-window",
+        type=int,
+        default=5,
+        help="Legacy acceleration smoothing sample count retained for older scripts",
+    )
+    parser.add_argument(
+        "--accel-scale",
+        type=float,
+        default=1000.0,
+        help="Raw MPU accelerometer units per g. Afternoon data behaves like 1000.",
+    )
+    parser.add_argument(
+        "--imu-axis",
+        choices=["ax", "ay", "az"],
+        default="ax",
+        help="MPU axis used for the dashboard's selected dynamic acceleration channel.",
+    )
+    parser.add_argument(
+        "--imu-axis-sign",
+        type=int,
+        choices=[-1, 1],
+        default=1,
+        help="Sign applied to the selected MPU dynamic acceleration channel.",
+    )
+    parser.add_argument(
+        "--accel-bias-window-sec",
+        type=float,
+        default=30.0,
+        help="Centered rolling median window used to estimate slow MPU gravity/bias.",
+    )
+    parser.add_argument(
+        "--accel-smooth-window-sec",
+        type=float,
+        default=3.0,
+        help="Centered rolling median window used to smooth acceleration channels.",
     )
     parser.add_argument(
         "--output-prefix", default="outputs/strategy",
@@ -140,7 +186,7 @@ def build_laps(
             f"matching GPS index {gps_start_idx}."
         )
         gps_df = gps_df.loc[gps_start_idx:].reset_index(drop=True)
-        boundaries = find_lap_boundaries_by_y_crossing(gps_df, 0, args.laps)
+        boundaries = find_lap_boundaries_by_start_gate(gps_df, 0, args.laps)
         if len(boundaries) < args.laps + 1:
             print(
                 f"Warning: only found {len(boundaries) - 1} complete laps "
@@ -198,6 +244,26 @@ def build_lap_summary(lap_merged: pd.DataFrame, lap_num: int) -> dict:
         "avg_power_w": float(lap_merged["power_w"].mean()),
         "total_energy_wh": total_energy,
         "efficiency_wh_per_km": efficiency,
+        "avg_gps_accel_m_s2": float(
+            lap_merged["gps_longitudinal_accel_m_s2"].mean()
+        ),
+        "max_gps_accel_m_s2": float(
+            lap_merged["gps_longitudinal_accel_m_s2"].max()
+        ),
+        "min_gps_accel_m_s2": float(
+            lap_merged["gps_longitudinal_accel_m_s2"].min()
+        ),
+        "avg_imu_dynamic_accel_m_s2": float(
+            lap_merged["imu_forward_dynamic_m_s2"].mean()
+        ),
+        "max_imu_dynamic_accel_m_s2": float(
+            lap_merged["imu_forward_dynamic_m_s2"].max()
+        ),
+        "min_imu_dynamic_accel_m_s2": float(
+            lap_merged["imu_forward_dynamic_m_s2"].min()
+        ),
+        "max_jerk_m_s3": float(lap_merged["jerk_m_s3"].max()),
+        "min_jerk_m_s3": float(lap_merged["jerk_m_s3"].min()),
         "elev_gain_m": elev_pos,
         "elev_loss_m": abs(elev_neg),
     }
@@ -233,6 +299,26 @@ def build_sector_summary(lap_merged: pd.DataFrame, lap_num: int, n_segments: int
             "avg_power_w": float(seg["power_w"].mean()),
             "avg_current_mA": float(seg["current_mA"].mean()),
             "max_current_mA": float(seg["current_mA"].max()),
+            "avg_gps_accel_m_s2": float(
+                seg["gps_longitudinal_accel_m_s2"].mean()
+            ),
+            "max_gps_accel_m_s2": float(
+                seg["gps_longitudinal_accel_m_s2"].max()
+            ),
+            "min_gps_accel_m_s2": float(
+                seg["gps_longitudinal_accel_m_s2"].min()
+            ),
+            "avg_imu_dynamic_accel_m_s2": float(
+                seg["imu_forward_dynamic_m_s2"].mean()
+            ),
+            "max_imu_dynamic_accel_m_s2": float(
+                seg["imu_forward_dynamic_m_s2"].max()
+            ),
+            "min_imu_dynamic_accel_m_s2": float(
+                seg["imu_forward_dynamic_m_s2"].min()
+            ),
+            "max_jerk_m_s3": float(seg["jerk_m_s3"].max()),
+            "min_jerk_m_s3": float(seg["jerk_m_s3"].min()),
             "energy_wh": energy,
             "efficiency_wh_per_km": eff,
             "avg_grade_pct": float(seg["grade_pct"].mean()),
@@ -308,10 +394,10 @@ def generate_findings(
     )
 
     if int(best_eff["lap"]) == int(fastest["lap"]):
-        lines.append("→ The fastest lap was also the most efficient.")
+        lines.append("-> The fastest lap was also the most efficient.")
     else:
         lines.append(
-            "→ The fastest and most efficient laps were different — "
+            "-> The fastest and most efficient laps were different - "
             "there is likely a speed-vs-efficiency trade-off to explore."
         )
 
@@ -325,12 +411,12 @@ def generate_findings(
             worst_bin = valid.loc[valid["efficiency_wh_per_km"].idxmax()]
             lines.append(
                 f"Flat-section best efficiency:  "
-                f"{best_bin['speed_bin_lo_kph']:.0f}–{best_bin['speed_bin_hi_kph']:.0f} km/h  "
+                f"{best_bin['speed_bin_lo_kph']:.0f}-{best_bin['speed_bin_hi_kph']:.0f} km/h  "
                 f"({best_bin['efficiency_wh_per_km']:.2f} Wh/km)"
             )
             lines.append(
                 f"Flat-section worst efficiency: "
-                f"{worst_bin['speed_bin_lo_kph']:.0f}–{worst_bin['speed_bin_hi_kph']:.0f} km/h  "
+                f"{worst_bin['speed_bin_lo_kph']:.0f}-{worst_bin['speed_bin_hi_kph']:.0f} km/h  "
                 f"({worst_bin['efficiency_wh_per_km']:.2f} Wh/km)"
             )
             lines.append("")
@@ -349,12 +435,12 @@ def generate_findings(
                 best_gain = delta.idxmin()
                 worst_regress = delta.idxmax()
                 lines.append(
-                    f"Lap {prev_lap}→{last_lap}: biggest efficiency improvement in sector {best_gain}  "
+                    f"Lap {prev_lap}->{last_lap}: biggest efficiency improvement in sector {best_gain}  "
                     f"({delta[best_gain]:+.2f} Wh/km)"
                 )
                 if delta[worst_regress] > 0:
                     lines.append(
-                        f"Lap {prev_lap}→{last_lap}: biggest remaining regression in sector {worst_regress}  "
+                        f"Lap {prev_lap}->{last_lap}: biggest remaining regression in sector {worst_regress}  "
                         f"({delta[worst_regress]:+.2f} Wh/km)"
                     )
 
@@ -386,7 +472,7 @@ def main() -> int:
     print(f"Reading telemetry: {args.telemetry}")
     telem_df = read_telemetry(args.telemetry)
 
-    print("Building laps…")
+    print("Building laps...")
     gps_laps, telem_laps, telem_aligned = build_laps(gps_df, telem_df, args)
 
     lap_summaries = []
@@ -401,10 +487,19 @@ def main() -> int:
         try:
             merged = merge_by_time(lap_telem, lap_gps, args.tolerance_sec)
         except ValueError as exc:
-            print(f"Lap {idx}: skipping — {exc}")
+            print(f"Lap {idx}: skipping - {exc}")
             continue
 
-        derived = derive_motion_energy(merged)
+        derived = derive_motion_energy(
+            merged,
+            forward_axis=args.forward_axis,
+            accel_window=args.accel_window,
+            accel_scale=args.accel_scale,
+            imu_axis=args.imu_axis,
+            imu_axis_sign=args.imu_axis_sign,
+            accel_bias_window_sec=args.accel_bias_window_sec,
+            accel_smooth_window_sec=args.accel_smooth_window_sec,
+        )
         all_derived.append(derived)
 
         lap_row = build_lap_summary(derived, idx)

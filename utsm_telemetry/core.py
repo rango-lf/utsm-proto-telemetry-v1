@@ -22,6 +22,8 @@ except ImportError as exc:
     ) from exc
 
 NAMESPACE = {"gpx": "http://www.topografix.com/GPX/1/1"}
+GRAVITY_M_S2 = 9.80665
+FORWARD_AXIS_CHOICES = ("ax", "ay", "az", "neg_ax", "neg_ay", "neg_az")
 
 
 # ---------------------------------------------------------------------------
@@ -105,17 +107,9 @@ def read_telemetry(telemetry_path: str) -> pd.DataFrame:
     df["ax_x100"] = pd.to_numeric(df["ax_x100"], errors="coerce")
     df["ay_x100"] = pd.to_numeric(df["ay_x100"], errors="coerce")
     df["az_x100"] = pd.to_numeric(df["az_x100"], errors="coerce")
-    df["accel_m_s2"] = np.sqrt(
-        (df["ax_x100"] / 100.0) ** 2
-        + (df["ay_x100"] / 100.0) ** 2
-        + (df["az_x100"] / 100.0) ** 2
-    )
-    df["accel_mag"] = np.sqrt(
-        (df["ax_x100"].abs() / 100.0) ** 2
-        + (df["ay_x100"].abs() / 100.0) ** 2
-        + (df["az_x100"].abs() / 100.0) ** 2
-    )
-    return df
+    if "amag_x100" in df.columns:
+        df["amag_x100"] = pd.to_numeric(df["amag_x100"], errors="coerce")
+    return derive_acceleration_features(df)
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +135,39 @@ def compute_distance(df: pd.DataFrame) -> float:
     if len(coords) < 2:
         return 0.0
     return float(np.linalg.norm(coords[1:] - coords[:-1], axis=1).sum())
+
+
+def add_gps_motion_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add GPS-native distance and speed before telemetry rows are merged in.
+
+    Speed must be derived on the GPX sampling clock. If it is computed after
+    telemetry rows are nearest-joined to GPS points, a one-second GPS movement
+    can be divided by a sub-second telemetry interval and the speed scale is
+    overstated.
+    """
+    df = add_xy(df.copy()).sort_values("time").reset_index(drop=True)
+    times = pd.to_datetime(df["time"])
+    df["gps_time"] = times
+    df["gps_dt_s"] = times.diff().dt.total_seconds().fillna(0.0).clip(lower=0)
+
+    xy = df[["x", "y"]].to_numpy()
+    seg = np.zeros(len(xy))
+    if len(xy) > 1:
+        seg[1:] = np.linalg.norm(xy[1:] - xy[:-1], axis=1)
+    df["gps_dist_m"] = seg
+    df["gps_cumdist_m"] = df["gps_dist_m"].cumsum()
+    df["gps_speed_m_s_raw"] = np.where(
+        df["gps_dt_s"] > 0,
+        df["gps_dist_m"] / df["gps_dt_s"],
+        0.0,
+    )
+    df["gps_speed_m_s"] = (
+        pd.Series(df["gps_speed_m_s_raw"])
+        .rolling(window=3, min_periods=1, center=True)
+        .median()
+    )
+    df["gps_speed_kph"] = df["gps_speed_m_s"] * 3.6
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +248,114 @@ def find_lap_boundaries_by_y_crossing(
 
     print(
         f"Y-line crossing detection: y_start={y_start:.1f}m, "
+        f"found {len(boundaries) - 1} lap boundaries (wanted {laps})."
+    )
+    return boundaries
+
+
+def find_lap_boundaries_by_start_gate(
+    gps: pd.DataFrame,
+    start_index: int,
+    laps: int,
+    y_band_width: float = 5.0,
+    x_window_width: float = 60.0,
+    min_gap_points: int = 50,
+    min_lap_distance_m: float = 2500.0,
+    pre_race_max_distance_m: float = 1000.0,
+) -> list[int]:
+    """Detect lap boundaries at a localized start/finish gate.
+
+    The current spike can occur while the car is still moving around before the
+    real line.  First find that short pre-race return to the start Y band, then
+    count only future re-entries near the same X/Y anchor.
+    """
+    gps_xy = add_xy(gps).reset_index(drop=True)
+    if gps_xy.empty:
+        return []
+    if start_index < 0 or start_index >= len(gps_xy):
+        raise IndexError("start_index is outside the GPS data range.")
+
+    xy = gps_xy[["x", "y"]].to_numpy()
+    seg_dists = np.zeros(len(xy))
+    if len(xy) > 1:
+        seg_dists[1:] = np.linalg.norm(xy[1:] - xy[:-1], axis=1)
+    cum_dist = np.cumsum(seg_dists)
+
+    y_start = float(gps_xy.loc[start_index, "y"])
+    y = gps_xy["y"].to_numpy()
+
+    anchor_idx = start_index
+    escaped = False
+    in_band = False
+    crossing_count = 0
+    for idx in range(start_index + 1, len(gps_xy)):
+        near_y = abs(y[idx] - y_start) <= y_band_width
+
+        if not escaped:
+            if not near_y:
+                escaped = True
+                in_band = False
+            continue
+
+        if near_y and not in_band:
+            in_band = True
+            if idx - start_index < min_gap_points:
+                continue
+            crossing_count += 1
+            if crossing_count % 2 == 0:
+                pre_race_dist = cum_dist[idx] - cum_dist[start_index]
+                if pre_race_dist <= pre_race_max_distance_m:
+                    anchor_idx = idx
+                break
+        elif not near_y:
+            in_band = False
+
+    anchor_x = float(gps_xy.loc[anchor_idx, "x"])
+    anchor_y = float(gps_xy.loc[anchor_idx, "y"])
+
+    def inside_gate(idx: int) -> bool:
+        return (
+            abs(float(gps_xy.loc[idx, "y"]) - anchor_y) <= y_band_width
+            and abs(float(gps_xy.loc[idx, "x"]) - anchor_x) <= x_window_width
+        )
+
+    boundaries = [anchor_idx]
+    current_lap_start_idx = anchor_idx
+    escaped_gate = False
+    in_gate = True
+
+    for idx in range(anchor_idx + 1, len(gps_xy)):
+        inside = inside_gate(idx)
+
+        if not escaped_gate:
+            if not inside:
+                escaped_gate = True
+                in_gate = False
+            continue
+
+        if inside and not in_gate:
+            in_gate = True
+            if idx - current_lap_start_idx < min_gap_points:
+                continue
+
+            lap_dist = cum_dist[idx] - cum_dist[current_lap_start_idx]
+            if lap_dist < min_lap_distance_m:
+                print(
+                    f"  Skipping short start-gate re-entry ({lap_dist:.0f}m) "
+                    f"at GPS index {idx}."
+                )
+                continue
+
+            boundaries.append(idx)
+            current_lap_start_idx = idx
+            if len(boundaries) >= laps + 1:
+                break
+        elif not inside:
+            in_gate = False
+
+    print(
+        "Start-gate detection: "
+        f"anchor=({anchor_x:.1f}m, {anchor_y:.1f}m), "
         f"found {len(boundaries) - 1} lap boundaries (wanted {laps})."
     )
     return boundaries
@@ -349,7 +484,9 @@ def merge_by_time(
 ) -> pd.DataFrame:
     """Nearest-time join between telemetry rows and GPS track points."""
     telemetry = telemetry.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
-    gps = gps.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+    gps = add_gps_motion_features(
+        gps.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+    )
     if telemetry.empty:
         raise ValueError("Telemetry contains no valid time values after alignment.")
 
@@ -373,7 +510,202 @@ def merge_by_time(
 # Feature derivation
 # ---------------------------------------------------------------------------
 
-def derive_motion_energy(df: pd.DataFrame) -> pd.DataFrame:
+def _axis_series(df: pd.DataFrame, forward_axis: str) -> pd.Series:
+    if forward_axis not in FORWARD_AXIS_CHOICES:
+        raise ValueError(
+            f"forward_axis must be one of {', '.join(FORWARD_AXIS_CHOICES)}. "
+            f"Got: {forward_axis}"
+        )
+
+    sign = -1.0 if forward_axis.startswith("neg_") else 1.0
+    axis = forward_axis.replace("neg_", "")
+    return sign * pd.to_numeric(df[f"{axis}_x100"], errors="coerce")
+
+
+def _sample_dt_seconds(df: pd.DataFrame) -> pd.Series:
+    if "dt_s" in df.columns:
+        return pd.to_numeric(df["dt_s"], errors="coerce").fillna(0.0).clip(lower=0)
+    if "time" in df.columns:
+        times = pd.to_datetime(df["time"])
+        return times.diff().dt.total_seconds().fillna(0.0).clip(lower=0)
+    if "timestamp_ms" in df.columns:
+        ts = pd.to_numeric(df["timestamp_ms"], errors="coerce")
+        return (ts.diff() / 1000.0).fillna(0.0).clip(lower=0)
+    return pd.Series(np.zeros(len(df)), index=df.index)
+
+
+def _window_samples(df: pd.DataFrame, window_s: float) -> int:
+    if window_s <= 0:
+        return 1
+    dt_s = _sample_dt_seconds(df)
+    positive = dt_s[dt_s > 0]
+    if positive.empty:
+        return max(1, int(round(window_s)))
+    median_dt = float(positive.median())
+    if median_dt <= 0:
+        return max(1, int(round(window_s)))
+    return max(1, int(round(window_s / median_dt)))
+
+
+def _correlation(a: pd.Series, b: pd.Series) -> float:
+    pair = pd.concat(
+        [pd.to_numeric(a, errors="coerce"), pd.to_numeric(b, errors="coerce")],
+        axis=1,
+    ).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(pair) < 5:
+        return float("nan")
+    left = pair.iloc[:, 0]
+    right = pair.iloc[:, 1]
+    if left.std() == 0 or right.std() == 0:
+        return float("nan")
+    return float(left.corr(right))
+
+
+def derive_acceleration_features(
+    df: pd.DataFrame,
+    forward_axis: str = "ax",
+    smooth_window: int | None = None,
+    gravity_g: float = 1.0,
+    accel_scale: float = 1000.0,
+    imu_axis: str = "ax",
+    imu_axis_sign: int = 1,
+    bias_window_s: float = 30.0,
+    smooth_window_s: float = 3.0,
+) -> pd.DataFrame:
+    """Add IMU-derived acceleration channels.
+
+    The MPU-6050 fields are labelled *_x100 in old dumps, but observed
+    magnitudes are milli-g: amag_x100 ~= 1000 means roughly 1 g.
+    """
+    df = df.copy()
+    if accel_scale <= 0:
+        raise ValueError("accel_scale must be positive.")
+    if forward_axis not in FORWARD_AXIS_CHOICES:
+        raise ValueError(
+            f"forward_axis must be one of {', '.join(FORWARD_AXIS_CHOICES)}. "
+            f"Got: {forward_axis}"
+        )
+    if imu_axis not in ("ax", "ay", "az"):
+        raise ValueError("imu_axis must be one of ax, ay, az.")
+    if imu_axis_sign not in (-1, 1):
+        raise ValueError("imu_axis_sign must be -1 or 1.")
+    if smooth_window is not None:
+        # Legacy compatibility for callers that still pass sample counts.
+        smooth_window_s = float(smooth_window)
+
+    ax_g = pd.to_numeric(df["ax_x100"], errors="coerce") / accel_scale
+    ay_g = pd.to_numeric(df["ay_x100"], errors="coerce") / accel_scale
+    az_g = pd.to_numeric(df["az_x100"], errors="coerce") / accel_scale
+    df["imu_ax_g"] = ax_g
+    df["imu_ay_g"] = ay_g
+    df["imu_az_g"] = az_g
+    if "amag_x100" in df.columns:
+        df["imu_total_g_reported"] = (
+            pd.to_numeric(df["amag_x100"], errors="coerce") / accel_scale
+        )
+    df["accel_total_g"] = np.sqrt(ax_g**2 + ay_g**2 + az_g**2)
+    df["imu_total_g"] = df["accel_total_g"]
+    df["accel_total_m_s2"] = df["accel_total_g"] * GRAVITY_M_S2
+    df["accel_dynamic_g"] = df["accel_total_g"] - gravity_g
+    df["accel_dynamic_m_s2"] = df["accel_dynamic_g"] * GRAVITY_M_S2
+    for axis, values_g in (("ax", ax_g), ("ay", ay_g), ("az", az_g)):
+        raw_m_s2 = values_g * GRAVITY_M_S2
+        df[f"imu_{axis}_m_s2"] = raw_m_s2
+        bias_window = _window_samples(df, bias_window_s)
+        bias = raw_m_s2.rolling(
+            window=bias_window,
+            min_periods=1,
+            center=True,
+        ).median()
+        dynamic = raw_m_s2 - bias
+        smooth_window_samples = _window_samples(df, smooth_window_s)
+        df[f"imu_{axis}_bias_m_s2"] = bias
+        df[f"imu_{axis}_dynamic_m_s2"] = dynamic
+        df[f"imu_{axis}_dynamic_smooth_m_s2"] = dynamic.rolling(
+            window=smooth_window_samples,
+            min_periods=1,
+            center=True,
+        ).median()
+
+    legacy_axis = forward_axis.replace("neg_", "")
+    legacy_sign = -1 if forward_axis.startswith("neg_") else 1
+    df["accel_longitudinal_raw_g"] = (
+        legacy_sign * pd.to_numeric(df[f"{legacy_axis}_x100"], errors="coerce")
+        / accel_scale
+    )
+    df["accel_longitudinal_m_s2"] = (
+        df["accel_longitudinal_raw_g"] * GRAVITY_M_S2
+    )
+    df["imu_forward_dynamic_m_s2"] = (
+        imu_axis_sign * df[f"imu_{imu_axis}_dynamic_smooth_m_s2"]
+    )
+    # Backward-compatible alias: this is now bias-corrected MPU dynamic accel,
+    # not raw longitudinal acceleration.
+    df["accel_longitudinal_smooth_m_s2"] = df["imu_forward_dynamic_m_s2"]
+
+    dt_s = _sample_dt_seconds(df)
+    delta_accel = df["accel_longitudinal_smooth_m_s2"].diff().fillna(0.0)
+    df["jerk_m_s3"] = np.where(dt_s > 0, delta_accel / dt_s, 0.0)
+
+    # Backward-compatible names used by the heatmap script.
+    df["accel_m_s2"] = df["accel_total_m_s2"]
+    df["accel_mag"] = df["accel_total_g"]
+    return df
+
+
+def add_gps_acceleration_features(
+    df: pd.DataFrame,
+    smooth_window_s: float = 3.0,
+) -> pd.DataFrame:
+    df = df.copy()
+    speed = pd.to_numeric(df["speed_m_s"], errors="coerce")
+    dt_s = pd.to_numeric(df["dt_s"], errors="coerce").replace(0, np.nan)
+    raw = speed.diff() / dt_s
+    df["gps_longitudinal_accel_raw_m_s2"] = raw.replace([np.inf, -np.inf], np.nan)
+    smooth_window = _window_samples(df, smooth_window_s)
+    df["gps_longitudinal_accel_m_s2"] = (
+        df["gps_longitudinal_accel_raw_m_s2"]
+        .rolling(window=smooth_window, min_periods=1, center=True)
+        .median()
+        .fillna(0.0)
+    )
+    return df
+
+
+def compute_accel_candidate_scores(df: pd.DataFrame) -> list[dict[str, float | str]]:
+    scores = []
+    gps_accel = df.get("gps_longitudinal_accel_m_s2", pd.Series(dtype=float))
+    current = pd.to_numeric(
+        df.get("current_mA", pd.Series(dtype=float)), errors="coerce"
+    ).abs()
+    power = pd.to_numeric(df.get("power_w", pd.Series(dtype=float)), errors="coerce")
+
+    for axis in ("ax", "ay", "az"):
+        column = f"imu_{axis}_dynamic_smooth_m_s2"
+        if column not in df.columns:
+            continue
+        values = pd.to_numeric(df[column], errors="coerce")
+        for sign, name in ((1, axis), (-1, f"-{axis}")):
+            candidate = sign * values
+            scores.append({
+                "candidate": name,
+                "gps_corr": _correlation(candidate, gps_accel),
+                "current_corr": _correlation(candidate, current),
+                "power_corr": _correlation(candidate, power),
+            })
+    return scores
+
+
+def derive_motion_energy(
+    df: pd.DataFrame,
+    forward_axis: str = "ax",
+    accel_window: int = 5,
+    accel_scale: float = 1000.0,
+    imu_axis: str = "ax",
+    imu_axis_sign: int = 1,
+    accel_bias_window_sec: float = 30.0,
+    accel_smooth_window_sec: float = 3.0,
+) -> pd.DataFrame:
     """Add dt_s, dist_m, elev_diff_m, speed_m_s, speed_kph, grade_pct,
     power_w, energy_wh, and cumdist_m columns to a merged lap DataFrame.
 
@@ -385,6 +717,16 @@ def derive_motion_energy(df: pd.DataFrame) -> pd.DataFrame:
     # Time delta
     times = pd.to_datetime(df["time"])
     df["dt_s"] = times.diff().dt.total_seconds().fillna(0.0).clip(lower=0)
+    df = derive_acceleration_features(
+        df,
+        forward_axis=forward_axis,
+        smooth_window=None,
+        accel_scale=accel_scale,
+        imu_axis=imu_axis,
+        imu_axis_sign=imu_axis_sign,
+        bias_window_s=accel_bias_window_sec,
+        smooth_window_s=accel_smooth_window_sec,
+    )
 
     # Point-to-point distance
     xy = df[["x", "y"]].to_numpy()
@@ -398,9 +740,19 @@ def derive_motion_energy(df: pd.DataFrame) -> pd.DataFrame:
     elev_diff[1:] = np.diff(elev)
     df["elev_diff_m"] = elev_diff
 
-    # Speed
-    df["speed_m_s"] = np.where(df["dt_s"] > 0, df["dist_m"] / df["dt_s"], 0.0)
+    # Speed comes from GPX-native timing when available. Computing speed after
+    # the telemetry merge can inflate values because telemetry samples are more
+    # frequent than GPS points.
+    fallback_speed_m_s = np.where(df["dt_s"] > 0, df["dist_m"] / df["dt_s"], 0.0)
+    if "gps_speed_m_s" in df.columns:
+        df["speed_m_s"] = (
+            pd.to_numeric(df["gps_speed_m_s"], errors="coerce")
+            .fillna(pd.Series(fallback_speed_m_s, index=df.index))
+        )
+    else:
+        df["speed_m_s"] = fallback_speed_m_s
     df["speed_kph"] = df["speed_m_s"] * 3.6
+    df = add_gps_acceleration_features(df, smooth_window_s=accel_smooth_window_sec)
 
     # Grade (%)
     df["grade_pct"] = np.where(

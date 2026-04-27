@@ -21,8 +21,12 @@ from utsm_telemetry.core import (
     parse_iso8601,
     parse_lap_time,
     align_telemetry,
+    add_gps_motion_features,
+    derive_acceleration_features,
     derive_motion_energy,
+    find_lap_boundaries_by_start_gate,
     merge_by_time,
+    read_gpx,
 )
 
 
@@ -48,6 +52,20 @@ def _make_telem(n: int = 10) -> pd.DataFrame:
         "ax_x100": np.zeros(n),
         "ay_x100": np.zeros(n),
         "az_x100": np.full(n, 100.0),
+    })
+
+
+def _make_gps_from_xy(points: list[tuple[float, float]]) -> pd.DataFrame:
+    lat0 = 43.0
+    lon0 = -79.0
+    meters_per_deg_lat = 110540.0
+    meters_per_deg_lon = 111320.0 * math.cos(math.radians(lat0))
+    times = pd.date_range("2026-04-11T12:00:00Z", periods=len(points), freq="1s")
+    return pd.DataFrame({
+        "lat": [lat0 + y / meters_per_deg_lat for x, y in points],
+        "lon": [lon0 + x / meters_per_deg_lon for x, y in points],
+        "elev": np.full(len(points), 100.0),
+        "time": times,
     })
 
 
@@ -136,7 +154,89 @@ class TestMergeByTime(unittest.TestCase):
         merged = merge_by_time(aligned, gps, tolerance_sec=2.0)
         self.assertIn("lat", merged.columns)
         self.assertIn("lon", merged.columns)
+        self.assertIn("gps_speed_kph", merged.columns)
         self.assertGreater(len(merged), 0)
+
+
+class TestStartGateLapDetection(unittest.TestCase):
+    def test_rejects_paddock_and_right_side_crossings(self):
+        points = [
+            (0, 0),
+            (0, 10),
+            (-10, 0),
+            (-10, 10),
+            (-20, 0),
+            (-25, 12),
+            (-30, 0),
+            (-35, 12),
+            (300, 0),
+            (300, 1000),
+            (-500, 1000),
+            (-500, 0),
+            (-45, 0),
+            (300, 0),
+            (300, 1000),
+            (-500, 1000),
+            (-500, 0),
+            (-45, 0),
+            (300, 0),
+            (300, 1000),
+            (-500, 1000),
+            (-500, 0),
+            (-45, 0),
+        ]
+        gps = _make_gps_from_xy(points)
+
+        boundaries = find_lap_boundaries_by_start_gate(
+            gps,
+            start_index=0,
+            laps=3,
+            min_gap_points=1,
+            min_lap_distance_m=2500.0,
+            pre_race_max_distance_m=100.0,
+        )
+
+        self.assertEqual(boundaries, [4, 12, 17, 22])
+
+    def test_afternoon_run_has_three_left_side_laps(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        gpx_path = os.path.join(root, "Utsm-2.gpx")
+        if not os.path.exists(gpx_path):
+            self.skipTest("Afternoon GPX fixture is not present.")
+
+        gps = read_gpx(gpx_path).loc[423:].reset_index(drop=True)
+        boundaries = find_lap_boundaries_by_start_gate(gps, 0, laps=3)
+
+        self.assertEqual(len(boundaries), 4)
+        for actual, expected in zip(boundaries, [149, 795, 1280, 1763]):
+            self.assertLessEqual(abs(actual - expected), 2)
+
+        xy = add_xy(gps)
+        anchor_x = float(xy.loc[boundaries[0], "x"])
+        for boundary in boundaries:
+            self.assertLessEqual(abs(float(xy.loc[boundary, "x"]) - anchor_x), 60.0)
+
+
+class TestGPSMotionFeatures(unittest.TestCase):
+    def test_gps_speed_uses_gps_timing(self):
+        gps = _make_gps(6, lat0=43.0, lon0=-79.0)
+        gps["lat"] = 43.0
+        gps["lon"] = -79.0 + np.arange(6) * 0.00001
+        with_speed = add_gps_motion_features(gps)
+        self.assertIn("gps_speed_kph", with_speed.columns)
+        self.assertGreater(with_speed["gps_speed_kph"].iloc[2], 0.0)
+
+    def test_merged_speed_not_inflated_by_telemetry_frequency(self):
+        gps = _make_gps(5)
+        gps["lat"] = 43.0
+        gps["lon"] = -79.0 + np.arange(5) * 0.00001
+        telem = _make_telem(17)
+        telem["timestamp_ms"] = np.arange(17) * 250
+        aligned = align_telemetry(telem, gps, None, 0.0)
+        merged = merge_by_time(aligned, gps, tolerance_sec=0.2)
+        derived = derive_motion_energy(merged)
+        gps_speed_max = add_gps_motion_features(gps)["gps_speed_kph"].max()
+        self.assertLessEqual(derived["speed_kph"].max(), gps_speed_max + 1e-9)
 
 
 class TestDeriveMotionEnergy(unittest.TestCase):
@@ -146,7 +246,22 @@ class TestDeriveMotionEnergy(unittest.TestCase):
         aligned = align_telemetry(telem, gps, None, 0.0)
         merged = merge_by_time(aligned, gps, tolerance_sec=2.0)
         derived = derive_motion_energy(merged)
-        for col in ("dt_s", "dist_m", "speed_kph", "power_w", "energy_wh", "cumdist_m"):
+        for col in (
+            "dt_s",
+            "dist_m",
+            "speed_kph",
+            "power_w",
+            "energy_wh",
+            "cumdist_m",
+            "accel_total_g",
+            "accel_total_m_s2",
+            "gps_longitudinal_accel_m_s2",
+            "imu_ax_m_s2",
+            "imu_total_g",
+            "imu_forward_dynamic_m_s2",
+            "accel_longitudinal_smooth_m_s2",
+            "jerk_m_s3",
+        ):
             self.assertIn(col, derived.columns, f"Missing column: {col}")
 
     def test_energy_nonnegative(self):
@@ -165,6 +280,91 @@ class TestDeriveMotionEnergy(unittest.TestCase):
         derived = derive_motion_energy(merged)
         diffs = derived["cumdist_m"].diff().dropna()
         self.assertTrue((diffs >= 0).all())
+
+    def test_gps_acceleration_from_speed_derivative(self):
+        gps = _make_gps(4)
+        telem = _make_telem(4)
+        merged = align_telemetry(telem, gps, None, 0.0)
+        merged["lat"] = gps["lat"]
+        merged["lon"] = gps["lon"]
+        merged["elev"] = gps["elev"]
+        merged["gps_speed_m_s"] = [0.0, 1.0, 3.0, 6.0]
+        derived = derive_motion_energy(
+            merged,
+            accel_smooth_window_sec=0.0,
+        )
+        self.assertIn("gps_longitudinal_accel_m_s2", derived.columns)
+        self.assertAlmostEqual(derived["gps_longitudinal_accel_m_s2"].iloc[1], 1.0)
+        self.assertAlmostEqual(derived["gps_longitudinal_accel_m_s2"].iloc[2], 2.0)
+
+
+class TestAccelerationFeatures(unittest.TestCase):
+    def test_mpu_scale_and_dynamic_columns(self):
+        telem = pd.DataFrame({
+            "timestamp_ms": [0, 1000, 2000],
+            "current_mA": [1000, 1000, 1000],
+            "voltage_mV": [24000, 24000, 24000],
+            "ax_x100": [0, 1000, 2000],
+            "ay_x100": [0, 0, 0],
+            "az_x100": [1000, 1000, 1000],
+            "amag_x100": [1000, 1414, 2236],
+        })
+        derived = derive_acceleration_features(
+            telem,
+            forward_axis="ax",
+            accel_scale=1000.0,
+            bias_window_s=0.0,
+            smooth_window_s=0.0,
+        )
+        self.assertAlmostEqual(derived["accel_longitudinal_raw_g"].iloc[1], 1.0)
+        self.assertAlmostEqual(
+            derived["accel_longitudinal_m_s2"].iloc[1],
+            9.80665,
+            places=5,
+        )
+        self.assertAlmostEqual(derived["imu_total_g_reported"].iloc[0], 1.0)
+        self.assertIn("imu_ax_dynamic_smooth_m_s2", derived.columns)
+
+    def test_stationary_bias_removal_near_zero(self):
+        telem = _make_telem(20)
+        telem["ax_x100"] = 40
+        telem["ay_x100"] = -120
+        telem["az_x100"] = 1000
+        derived = derive_acceleration_features(
+            telem,
+            imu_axis="ax",
+            accel_scale=1000.0,
+            bias_window_s=30.0,
+            smooth_window_s=3.0,
+        )
+        self.assertLess(abs(float(derived["imu_forward_dynamic_m_s2"].median())), 1e-9)
+
+    def test_negative_axis(self):
+        telem = _make_telem(3)
+        telem["ax_x100"] = [1000, 2000, 3000]
+        derived = derive_acceleration_features(
+            telem,
+            forward_axis="neg_ax",
+            accel_scale=1000.0,
+            bias_window_s=0.0,
+            smooth_window_s=0.0,
+        )
+        self.assertAlmostEqual(derived["accel_longitudinal_raw_g"].iloc[0], -1.0)
+        self.assertAlmostEqual(derived["accel_longitudinal_raw_g"].iloc[2], -3.0)
+
+    def test_raw_columns_are_not_mutated(self):
+        telem = _make_telem(3)
+        original = telem[["ax_x100", "ay_x100", "az_x100"]].copy()
+        derived = derive_acceleration_features(telem)
+        pd.testing.assert_frame_equal(
+            original.reset_index(drop=True),
+            derived[["ax_x100", "ay_x100", "az_x100"]].reset_index(drop=True),
+        )
+
+    def test_bad_axis(self):
+        telem = _make_telem(3)
+        with self.assertRaises(ValueError):
+            derive_acceleration_features(telem, forward_axis="bad_axis")
 
 
 if __name__ == "__main__":
