@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import pandas as pd
 from argparse import Namespace
-from build_interactive_dashboard import make_payload
+from build_interactive_dashboard import build_html, make_payload, make_run_payload
 from utsm_telemetry.core import (
     add_xy,
     compute_distance,
@@ -34,8 +34,14 @@ from utsm_telemetry.simulation import (
     build_strategy_report,
     build_strategy_segments,
     build_strategy_samples,
+    build_motor_config,
+    classify_strategy_action,
+    evaluate_baseline_prediction,
     fit_empirical_energy_model,
+    infer_gear_ratio,
     optimize_speed_profile,
+    predict_current_mA,
+    predict_power_w,
 )
 
 
@@ -429,7 +435,9 @@ class TestSimulation(unittest.TestCase):
             speed = 12.0 + (i % 4) * 4.0
             dt_s = 1.0
             dist_m = speed / 3.6 * dt_s
-            power_w = 20.0 + 2.0 * speed + 0.4 * (speed ** 2)
+            accel = 0.35 if i % 4 == 0 else (-0.15 if i % 4 == 3 else 0.0)
+            power_w = 20.0 + 2.0 * speed + 0.4 * (speed ** 2) + max(accel, 0.0) * 80.0
+            current_mA = 1000.0 + 45.0 * speed + max(accel, 0.0) * 26000.0
             energy_j = power_w * dt_s
             run_dist += dist_m
             run_energy += energy_j
@@ -440,7 +448,8 @@ class TestSimulation(unittest.TestCase):
                 "run_cumdist_m": run_dist,
                 "grade_pct": 0.0,
                 "speed_kph": speed,
-                "gps_longitudinal_accel_m_s2": 0.0,
+                "gps_longitudinal_accel_m_s2": accel,
+                "current_mA": current_mA,
                 "power_w": power_w,
                 "energy_j": energy_j,
                 "cum_energy_j": run_energy,
@@ -456,11 +465,101 @@ class TestSimulation(unittest.TestCase):
             speed_max_kph=30.0,
             max_delta_kph_per_segment=4.0,
             speed_step_kph=2.0,
+            hold_delta_kph=1.0,
+            fuse_current_ma=20000.0,
+            fuse_max_duration_sec=1.0,
+            current_penalty_weight=5.0,
+            start_speed_kph=0.0,
         )
         self.assertTrue((profile["target_speed_kph"] >= 10.0).all())
         self.assertTrue((profile["target_speed_kph"] <= 30.0).all())
-        self.assertTrue((profile["speed_delta_kph"].abs() <= 4.0 + 1e-9).all())
-        self.assertLess(profile["pred_energy_j"].sum(), segments["baseline_energy_j"].sum())
+        self.assertTrue((profile["speed_delta_kph"].abs().iloc[1:] <= 4.0 + 1e-9).all())
+        self.assertTrue(set(profile["action"]).issubset({"accelerate", "hold", "coast"}))
+        self.assertEqual(profile["action"].iloc[0], "accelerate")
+        self.assertEqual(profile["entry_speed_kph"].iloc[0], 0.0)
+        self.assertIn("pred_current_mA", profile.columns)
+        self.assertIn("pred_peak_current_mA", profile.columns)
+        self.assertIn("throttle_duty", profile.columns)
+        self.assertTrue(np.isfinite(profile["pred_energy_j"].sum()))
+        self.assertGreater(profile["pred_energy_j"].iloc[0], 0.0)
+
+    def test_coast_strategy_predicts_zero_propulsion_current(self):
+        rows = []
+        run_dist = 0.0
+        run_energy = 0.0
+        for i in range(16):
+            speed = 22.0 - (i % 4) * 2.0
+            accel = -0.2 if i % 4 == 3 else 0.05
+            dt_s = 1.0
+            dist_m = speed / 3.6
+            current_mA = 900.0 if accel <= 0 else 6000.0
+            power_w = current_mA / 1000.0 * 24.0
+            run_dist += dist_m
+            run_energy += power_w
+            rows.append({
+                "time": pd.Timestamp("2026-04-11T12:00:00Z") + pd.Timedelta(seconds=i),
+                "dt_s": dt_s,
+                "dist_m": dist_m,
+                "run_cumdist_m": run_dist,
+                "grade_pct": 0.0,
+                "speed_kph": speed,
+                "gps_longitudinal_accel_m_s2": accel,
+                "current_mA": current_mA,
+                "voltage_mV": 24000.0,
+                "power_w": power_w,
+                "energy_j": power_w,
+                "cum_energy_j": run_energy,
+            })
+        df = pd.DataFrame(rows)
+        model = fit_empirical_energy_model(df)
+        profile = build_strategy_segments(df, segments=4)
+        profile["target_speed_kph"] = [20.0, 18.0, 16.0, 14.0]
+        profile["entry_speed_kph"] = [22.0, 20.0, 18.0, 16.0]
+        profile["speed_delta_kph"] = profile["target_speed_kph"] - profile["entry_speed_kph"]
+        profile["action"] = ["coast", "coast", "coast", "coast"]
+        profile["accel_demand_m_s2"] = -0.1
+        profile["segment_time_s"] = 1.0
+        profile["pred_current_mA"] = [
+            predict_current_mA(model, speed, -0.1, 0.0, 0.0, "coast")
+            for speed in profile["target_speed_kph"]
+        ]
+        profile["pred_power_w"] = [
+            predict_power_w(model, speed, -0.1, 0.0, 0.0, "coast")
+            for speed in profile["target_speed_kph"]
+        ]
+        profile["pred_energy_j"] = profile["pred_power_w"] * profile["segment_time_s"]
+        self.assertTrue((profile["pred_current_mA"] == 0.0).all())
+        self.assertTrue((profile["pred_power_w"] == 0.0).all())
+        self.assertTrue((profile["pred_energy_j"] == 0.0).all())
+
+    def test_infer_gear_ratio_from_top_speed(self):
+        ratio = infer_gear_ratio(top_speed_kph=39.0, motor_top_rpm=7560.0, wheel_diameter_m=0.50)
+        expected_wheel_rpm = (39.0 / 3.6) / (math.pi * 0.50) * 60.0
+        self.assertAlmostEqual(ratio, 7560.0 / expected_wheel_rpm)
+        config = build_motor_config(0.50)
+        self.assertAlmostEqual(config["inferred_gear_ratio"], ratio)
+        self.assertEqual(config["vehicle_mass_kg"], 100.0)
+
+    def test_baseline_prediction_evaluation_reports_error(self):
+        df = pd.DataFrame({
+            "time": pd.date_range("2026-04-11T12:00:00Z", periods=12, freq="1s"),
+            "dt_s": [1.0] * 12,
+            "dist_m": [5.0] * 12,
+            "run_cumdist_m": np.arange(1, 13) * 5.0,
+            "grade_pct": [0.0, 1.0, 1.0, 0.0, -1.0, -1.0, 0.0, 2.0, 2.0, 0.0, -2.0, -2.0],
+            "speed_kph": [18.0, 19.0, 20.0, 20.0, 18.0, 17.0, 18.0, 20.0, 22.0, 21.0, 19.0, 18.0],
+            "gps_longitudinal_accel_m_s2": [0.0, 0.2, 0.2, 0.0, -0.1, -0.1, 0.1, 0.2, 0.2, 0.0, -0.1, -0.1],
+            "current_mA": [1000, 5000, 5200, 1500, 600, 500, 1200, 6500, 7000, 1800, 500, 500],
+            "voltage_mV": [24000] * 12,
+            "power_w": [24, 120, 125, 36, 14, 12, 29, 156, 168, 43, 12, 12],
+            "energy_j": [24, 120, 125, 36, 14, 12, 29, 156, 168, 43, 12, 12],
+            "cum_energy_j": np.cumsum([24, 120, 125, 36, 14, 12, 29, 156, 168, 43, 12, 12]),
+        })
+        model = fit_empirical_energy_model(df)
+        segments = build_strategy_segments(df, segments=4)
+        metrics = evaluate_baseline_prediction(segments, model, motor_config=build_motor_config())
+        self.assertIn("energy_error_pct", metrics)
+        self.assertGreaterEqual(metrics["power_mae_w"], 0.0)
 
     def test_strategy_samples_and_report(self):
         df = pd.DataFrame({
@@ -471,6 +570,7 @@ class TestSimulation(unittest.TestCase):
             "grade_pct": [0.0, 0.0, 0.0, 0.0],
             "speed_kph": [18.0, 18.0, 20.0, 20.0],
             "gps_longitudinal_accel_m_s2": [0.0, 0.0, 0.1, 0.0],
+            "current_mA": [1000.0, 1000.0, 4000.0, 1100.0],
             "power_w": [100.0, 100.0, 120.0, 120.0],
             "energy_j": [100.0, 100.0, 120.0, 120.0],
             "cum_energy_j": [100.0, 200.0, 320.0, 440.0],
@@ -484,33 +584,42 @@ class TestSimulation(unittest.TestCase):
             "entry_speed_kph": [18.0, 18.0],
             "speed_delta_kph": [0.0, -2.0],
             "action": ["hold", "coast"],
+            "pred_current_mA": [1000.0, 400.0],
             "pred_power_w": [100.0, 90.0],
             "segment_time_s": [2.0, 2.25],
             "pred_energy_j": [200.0, 202.5],
+            "over_fuse_limit": [False, False],
+            "fuse_over_duration_s": [0.0, 0.0],
         })
         samples = build_strategy_samples(df, profile)
         report = build_strategy_report(df, profile, time_budget_sec=5.0)
         self.assertIn("pred_cum_energy_j", samples.columns)
-        self.assertIn("Suggested acceleration segments:", report)
+        self.assertIn("Top accelerate regions:", report)
+        self.assertIn("pred_current_mA", samples.columns)
 
     def test_dashboard_payload_includes_strategy_overlay_fields(self):
         df = pd.DataFrame({
             "time": pd.date_range("2026-04-11T12:00:00Z", periods=4, freq="1s"),
             "lap": [1, 1, 1, 1],
             "elapsed_s": [0.0, 1.0, 2.0, 3.0],
+            "dt_s": [1.0, 1.0, 1.0, 1.0],
             "x": [0.0, 1.0, 2.0, 3.0],
             "y": [0.0, 0.0, 0.0, 0.0],
             "segment": [1, 1, 2, 2],
             "current_mA": [100.0, 110.0, 120.0, 130.0],
+            "pred_current_mA": [95.0, 105.0, 115.0, 125.0],
             "speed_kph": [18.0, 20.0, 22.0, 24.0],
             "target_speed_kph": [19.0, 19.0, 21.0, 21.0],
             "gps_longitudinal_accel_abs_m_s2": [0.1, 0.2, 0.1, 0.2],
             "imu_forward_dynamic_m_s2": [0.05, 0.04, 0.06, 0.03],
             "power_w": [100.0, 110.0, 120.0, 130.0],
+            "pred_power_w": [95.0, 105.0, 115.0, 125.0],
             "energy_j": [100.0, 110.0, 120.0, 130.0],
             "cum_energy_j": [100.0, 210.0, 330.0, 460.0],
+            "pred_energy_j": [95.0, 105.0, 110.0, 120.0],
             "pred_cum_energy_j": [95.0, 200.0, 310.0, 430.0],
             "strategy_action": ["hold", "hold", "accelerate", "accelerate"],
+            "pred_over_fuse_limit": [False, False, False, False],
         })
         strategy_profile = pd.DataFrame({
             "segment": [1, 2],
@@ -519,12 +628,17 @@ class TestSimulation(unittest.TestCase):
             "target_speed_kph": [19.0, 21.0],
             "entry_speed_kph": [18.0, 19.0],
             "speed_delta_kph": [1.0, 2.0],
+            "pred_current_mA": [100.0, 120.0],
+            "pred_power_w": [95.0, 115.0],
             "pred_energy_j": [200.0, 230.0],
             "action": ["accelerate", "accelerate"],
+            "over_fuse_limit": [False, False],
+            "segment_time_s": [2.0, 2.0],
+            "fuse_over_duration_s": [0.0, 0.0],
         })
         args = Namespace(
-            gps="Utsm-2.gpx",
-            telemetry="telemetry.csv",
+            strategy_time_budget_sec=4.0,
+            fuse_current_ma=20000.0,
             forward_axis="ax",
             accel_scale=1000.0,
             imu_axis="ax",
@@ -532,19 +646,80 @@ class TestSimulation(unittest.TestCase):
             accel_bias_window_sec=30.0,
             accel_smooth_window_sec=8.0,
         )
-        payload = make_payload(
+        run_payload = make_run_payload(
+            {"id": "afternoon", "label": "Afternoon", "gps": "Utsm-2.gpx", "telemetry": "telemetry.csv"},
             df,
             strategy_profile,
             "=== Speed Strategy Report ===",
-            4.0,
             args,
         )
+        payload = make_payload([run_payload], args)
         self.assertIn("targetSpeed", payload["metrics"])
-        self.assertIn("strategy", payload)
-        self.assertEqual(payload["samples"][0]["targetSpeed"], 19.0)
-        self.assertEqual(payload["samples"][0]["predRunEnergyJ"], 95.0)
-        self.assertEqual(payload["samples"][2]["strategyAction"], "accelerate")
-        self.assertEqual(len(payload["strategy"]["segments"]), 2)
+        self.assertIn("afternoon", payload["runs"])
+        self.assertEqual(payload["runs"]["afternoon"]["samples"][0]["targetSpeed"], 19.0)
+        self.assertEqual(payload["runs"]["afternoon"]["samples"][0]["predRunEnergyJ"], 95.0)
+        self.assertEqual(payload["runs"]["afternoon"]["samples"][2]["strategyAction"], "accelerate")
+        self.assertEqual(len(payload["runs"]["afternoon"]["segments"]), 2)
+        self.assertEqual(payload["runs"]["afternoon"]["samples"][0]["predCurrent"], 95.0)
+        self.assertIn("predPeakCurrent", payload["runs"]["afternoon"]["samples"][0])
+        self.assertIn("motor", payload["runs"]["afternoon"]["strategy"])
+        self.assertIn("start_speed_kph", payload["runs"]["afternoon"]["strategy"])
+        self.assertIn("strategyLegend", payload)
+        self.assertIn("accelerate", payload["strategyLegend"])
+        self.assertIn("mapLegend", payload)
+        self.assertIn("label_dx_m", payload["runs"]["afternoon"]["segments"][0])
+        html = build_html(payload)
+        self.assertNotIn(' : "#111827"', html)
+        self.assertIn("Trail color:", html)
+
+    def test_current_penalty_pushes_down_fuse_risk(self):
+        rows = []
+        run_dist = 0.0
+        run_energy = 0.0
+        for i in range(18):
+            speed = 20.0 if i % 3 else 28.0
+            accel = 0.55 if i % 3 == 0 else 0.0
+            dt_s = 1.0
+            dist_m = speed / 3.6
+            power_w = 40.0 + 1.5 * speed + max(accel, 0.0) * 120.0
+            current_mA = 1500.0 + 30.0 * speed + max(accel, 0.0) * 45000.0
+            run_dist += dist_m
+            run_energy += power_w * dt_s
+            rows.append({
+                "time": pd.Timestamp("2026-04-11T12:00:00Z") + pd.Timedelta(seconds=i),
+                "dt_s": dt_s,
+                "dist_m": dist_m,
+                "run_cumdist_m": run_dist,
+                "grade_pct": 0.0,
+                "speed_kph": speed,
+                "gps_longitudinal_accel_m_s2": accel,
+                "current_mA": current_mA,
+                "power_w": power_w,
+                "energy_j": power_w * dt_s,
+                "cum_energy_j": run_energy,
+            })
+        df = pd.DataFrame(rows)
+        model = fit_empirical_energy_model(df)
+        segments = build_strategy_segments(df, segments=6)
+        profile = optimize_speed_profile(
+            segments,
+            model,
+            time_budget_sec=float(segments["baseline_time_s"].sum() * 1.1),
+            speed_min_kph=12.0,
+            speed_max_kph=30.0,
+            max_delta_kph_per_segment=6.0,
+            speed_step_kph=2.0,
+            fuse_current_ma=20000.0,
+            fuse_max_duration_sec=1.0,
+            current_penalty_weight=8.0,
+        )
+        longest = 0.0
+        run = 0.0
+        for over, duration in zip(profile["over_fuse_limit"], profile["fuse_over_duration_s"]):
+            run = run + float(duration) if over else 0.0
+            longest = max(longest, run)
+        self.assertLessEqual(longest, 1.0)
+        self.assertTrue(set(profile["action"]).issubset({"accelerate", "hold", "coast"}))
 
 
 if __name__ == "__main__":

@@ -792,12 +792,24 @@ def derive_motion_energy(
     df["speed_kph"] = df["speed_m_s"] * 3.6
     df = add_gps_acceleration_features(df, smooth_window_s=accel_smooth_window_sec)
 
-    # Grade (%)
-    df["grade_pct"] = np.where(
+    # Grade (%). Raw point-to-point GPX elevation is noisy, so keep the raw
+    # grade but also expose a centered smoothed grade for strategy modeling.
+    df["grade_raw_pct"] = np.where(
         df["dist_m"] > 0.01,
         (df["elev_diff_m"] / df["dist_m"]) * 100.0,
         0.0,
     )
+    grade_window = max(3, _window_samples(df, 8.0))
+    df["grade_pct"] = (
+        pd.Series(df["grade_raw_pct"], index=df.index)
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+        .rolling(window=grade_window, min_periods=1, center=True)
+        .median()
+        .clip(lower=-12.0, upper=12.0)
+    )
+    df["uphill_grade_pct"] = df["grade_pct"].clip(lower=0.0)
+    df["downhill_grade_pct"] = (-df["grade_pct"]).clip(lower=0.0)
 
     # Power and energy
     df["power_w"] = (df["current_mA"].abs() / 1000.0) * (df["voltage_mV"] / 1000.0)

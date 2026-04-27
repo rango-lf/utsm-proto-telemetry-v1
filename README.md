@@ -7,7 +7,7 @@ The current analysis path is centered on:
 1. `dumper.py` for serial telemetry capture.
 2. `utsm_telemetry/` for shared parsing, alignment, lap detection, motion, energy, and acceleration helpers.
 3. `analyze_strategy.py` for lap, sector, speed-bin, and strategy reports.
-4. `build_interactive_dashboard.py` for the fast local HTML replay dashboard and strategy overlay.
+4. `build_interactive_dashboard.py` for the multi-run HTML replay dashboard and strategy overlay.
 
 Generated artifacts are reproducible and ignored by Git. Regenerate reports and dashboards into `outputs/` when needed.
 
@@ -40,49 +40,52 @@ Some dumps also include `amag_x100`. Despite the column names, the MPU-6050 acce
 
 GPX files must include latitude, longitude, elevation, and timestamps. Speed is derived from GPX point-to-point movement on the GPX sampling clock, not by integrating noisy accelerometer data.
 
-## Current Afternoon Demo
+## Canonical Runs
 
-The canonical afternoon demo uses:
+The main dashboard now packages both known April 11 runs:
 
-- `Utsm-2.gpx`
-- `telemetry_dumps\telemetry_20260411_122713.csv`
-- `--laps 3`
-- `--split-method start`
+- `Utsm.gpx` + `telemetry_dumps\telemetry_20260411_112302.csv`
+- `Utsm-2.gpx` + `telemetry_dumps\telemetry_20260411_122713.csv`
 
-The start split now uses a localized left-side start/finish gate. It ignores paddock movement before the real start and rejects the false right-side same-Y crossing.
+Use `--laps 4 --split-method start` as the standard replay/strategy path. The start split uses a localized left-side start/finish gate and rejects the false right-side same-Y crossing.
 
 ## Interactive Dashboard
 
 Build the dashboard:
 
 ```powershell
-python build_interactive_dashboard.py --laps 3 --output outputs\afternoon_interactive_dashboard.html
+python build_interactive_dashboard.py --laps 4 --output outputs\telemetry_strategy_dashboard.html
 ```
 
 Useful strategy knobs:
 
 ```powershell
-python build_interactive_dashboard.py --laps 3 --strategy-segments 24 --strategy-speed-min-kph 8 --strategy-speed-max-kph 40 --strategy-max-delta-kph-per-segment 6 --output outputs\afternoon_interactive_dashboard.html
+python build_interactive_dashboard.py --laps 4 --strategy-segments 24 --strategy-time-budget-sec 2100 --fuse-current-ma 20000 --fuse-max-duration-sec 1.0 --output outputs\telemetry_strategy_dashboard.html
 ```
 
-Open `outputs\afternoon_interactive_dashboard.html` in a browser. It is a self-contained HTML file with:
+Open `outputs\telemetry_strategy_dashboard.html` in a browser. It is a self-contained HTML file with:
 
-- one manual time slider
+- run switcher for the morning and afternoon datasets
+- one manual time slider per selected run
 - play/pause replay
 - full-course gray reference trace
 - current-lap colored trail
+- explicit action-colored strategy regions on the map (`accelerate`, `hold`, `coast`)
+- segment labels on the map
 - synchronized current, speed, GPS acceleration, MPU dynamic acceleration, power, and cumulative total-energy charts
-- color selector for track overlay metrics
-- strategy target-speed overlay on the map plus speed/energy comparison overlays
-- optional lap-boundary debug markers
+- current, speed, power, and cumulative-energy prediction overlays
+- visible `20 A` fuse threshold on the current chart
+- map mode switch between action-region view and metric-colored trail view
 
 The strategy layer uses the same optimized profile as `simulate_speed_strategy.py`. In the dashboard:
 
-- `Strategy` toggle shows or hides the optimized target-speed overlay
-- `Strategy target speed` can be selected as the map coloring metric
+- `Strategy` toggle shows or hides the simulated action regions
+- `Labels` toggle shows or hides per-segment labels
+- `Strategy target speed` can still be selected as a map coloring metric
 - the speed chart overlays actual speed against optimized target speed
+- the current chart overlays predicted current and marks the fuse threshold
 - the total-energy chart overlays actual cumulative joules against predicted cumulative joules
-- the live readout shows current segment, target speed, and suggested action
+- the live readout shows current segment, action, target speed, predicted current, and predicted power
 
 Acceleration is split into two separate channels:
 
@@ -93,12 +96,14 @@ The dashboard payload also includes MPU axis/sign diagnostic correlations for `a
 
 The total-energy chart is cumulative run joules versus elapsed time. It spans the whole run and does not reset at lap boundaries.
 
+For the morning run, the telemetry capture ends before the fourth lap finishes. The dashboard keeps that lap in the replay using GPS-backed samples with zeroed telemetry channels so the 4-lap strategy view remains complete.
+
 ## Strategy Analysis
 
 Run the corrected afternoon analysis:
 
 ```powershell
-python analyze_strategy.py Utsm-2.gpx telemetry_dumps\telemetry_20260411_122713.csv --laps 3 --split-method start --output-prefix outputs\afternoon_clean_demo
+python analyze_strategy.py Utsm-2.gpx telemetry_dumps\telemetry_20260411_122713.csv --laps 4 --split-method start --output-prefix outputs\afternoon_clean_demo
 ```
 
 This writes:
@@ -121,10 +126,10 @@ The analysis computes:
 
 ## Speed Strategy Simulation
 
-Run the first empirical optimizer:
+Run the empirical 3-state optimizer:
 
 ```powershell
-python simulate_speed_strategy.py Utsm-2.gpx telemetry_dumps\telemetry_20260411_122713.csv --laps 3 --split-method start --segments 24 --output-prefix outputs\speed_strategy
+python simulate_speed_strategy.py Utsm-2.gpx telemetry_dumps\telemetry_20260411_122713.csv --laps 4 --split-method start --segments 24 --time-budget-sec 2100 --fuse-current-ma 20000 --fuse-max-duration-sec 1.0 --output-prefix outputs\speed_strategy
 ```
 
 This writes:
@@ -135,9 +140,7 @@ This writes:
 
 The dashboard generator runs the same optimizer internally so the HTML stays in sync with the standalone strategy report.
 
-The first version does not use a neural model. It fits an empirical power model from historical samples and then chooses a target speed profile by distance while staying within a time budget and per-segment speed-change limits.
-
-For the corrected afternoon run, the current reference result is 3 complete laps. Lap 2 is the most efficient full lap, while lap 3 is the fastest full lap.
+The current optimizer is empirical and deterministic. It fits current and power models from historical samples, simulates explicit `accelerate` / `hold` / `coast` behavior by equal-distance segment, minimizes predicted joules, keeps total time under the configured budget, and rejects strategies that stay above the fuse current threshold for too long.
 
 ## Optional Animation Fallback
 
@@ -164,13 +167,13 @@ Generate legacy current heatmaps:
 python gps_current_heatmap.py Utsm.gpx telemetry_dumps\telemetry_20260411_112302.csv --laps 4 --split-method start --output outputs\current_heatmap.png
 ```
 
-Run smoke tests and regenerate the afternoon demo:
+Run smoke tests and regenerate the multi-run dashboard:
 
 ```powershell
 python tests\test_smoke.py
-python build_interactive_dashboard.py --laps 3 --output outputs\afternoon_interactive_dashboard.html
-python analyze_strategy.py Utsm-2.gpx telemetry_dumps\telemetry_20260411_122713.csv --laps 3 --split-method start --output-prefix outputs\afternoon_clean_demo
-python simulate_speed_strategy.py Utsm-2.gpx telemetry_dumps\telemetry_20260411_122713.csv --laps 3 --split-method start --segments 24 --output-prefix outputs\speed_strategy
+python build_interactive_dashboard.py --laps 4 --output outputs\telemetry_strategy_dashboard.html
+python analyze_strategy.py Utsm-2.gpx telemetry_dumps\telemetry_20260411_122713.csv --laps 4 --split-method start --output-prefix outputs\afternoon_clean_demo
+python simulate_speed_strategy.py Utsm-2.gpx telemetry_dumps\telemetry_20260411_122713.csv --laps 4 --split-method start --segments 24 --time-budget-sec 2100 --fuse-current-ma 20000 --fuse-max-duration-sec 1.0 --output-prefix outputs\speed_strategy
 ```
 
 ## Notes And Limits
