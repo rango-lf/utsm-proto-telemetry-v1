@@ -1,7 +1,7 @@
 """Core helpers shared across the UTSM telemetry toolchain.
 
 Extracted from gps_current_heatmap.py so that analyze_strategy.py (and
-any future scripts) can import them without duplicating logic. 
+any future scripts) can import them without duplicating logic.
 
 Does this actually work? God only knows.
 """
@@ -576,6 +576,11 @@ def derive_acceleration_features(
 
     The MPU-6050 fields are labelled *_x100 in old dumps, but observed
     magnitudes are milli-g: amag_x100 ~= 1000 means roughly 1 g.
+
+    NOTE: The ``smooth_window`` parameter (sample count) is deprecated.
+    Pass ``smooth_window_s`` (seconds) instead.  If ``smooth_window`` is
+    provided it is converted to seconds for backward compatibility, but
+    this will be removed in a future version.
     """
     df = df.copy()
     if accel_scale <= 0:
@@ -590,7 +595,12 @@ def derive_acceleration_features(
     if imu_axis_sign not in (-1, 1):
         raise ValueError("imu_axis_sign must be -1 or 1.")
     if smooth_window is not None:
-        # Legacy compatibility for callers that still pass sample counts.
+        import warnings
+        warnings.warn(
+            "smooth_window (sample count) is deprecated; pass smooth_window_s (seconds) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         smooth_window_s = float(smooth_window)
 
     ax_g = pd.to_numeric(df["ax_x100"], errors="coerce") / accel_scale
@@ -843,3 +853,114 @@ def compute_lap_stats(df: pd.DataFrame) -> dict[str, float]:
     else:
         stats["avg_speed_m_s"] = 0.0
     return stats
+
+
+# ---------------------------------------------------------------------------
+# Lap-building orchestration
+# ---------------------------------------------------------------------------
+
+def build_laps(
+    gps_df: pd.DataFrame,
+    telem_df: pd.DataFrame,
+    *,
+    laps: int,
+    split_method: str = "start",
+    start_time: "str | pd.Timestamp | None" = None,
+    time_offset_ms: float = 0.0,
+    tolerance_sec: float = 1.5,
+    lap_times: "list[str] | None" = None,
+) -> tuple[list[pd.DataFrame], list[pd.DataFrame], pd.DataFrame]:
+    """Return (gps_laps, telem_laps, aligned_telem_df).
+
+    Centralised lap-building so that gps_current_heatmap.py,
+    analyze_strategy.py, build_interactive_dashboard.py, and
+    simulate_speed_strategy.py all use identical alignment and
+    lap-splitting logic.
+
+    Parameters
+    ----------
+    gps_df:
+        Raw DataFrame from read_gpx().
+    telem_df:
+        Raw DataFrame from read_telemetry().
+    laps:
+        Expected number of racing laps.
+    split_method:
+        One of ``"start"`` (start-gate detector), ``"points"``,
+        ``"time"``, or ``"line"``.
+    start_time:
+        ISO 8601 string or Timestamp to force-align telemetry start.
+        ``None`` aligns to the first GPS point.
+    time_offset_ms:
+        Additional millisecond nudge applied after start alignment.
+    tolerance_sec:
+        Merge tolerance for ``merge_by_time``.
+    lap_times:
+        Optional list of elapsed MM:SS / H:MM:SS strings that override
+        automatic lap detection.
+    """
+    if lap_times:
+        track_start = gps_df["time"].iloc[0]
+        lap_timestamps = [parse_lap_time(t, track_start) for t in lap_times]
+        if len(lap_timestamps) < 2:
+            raise ValueError("lap_times requires at least 2 timestamps.")
+        spike_idx = find_start_spike(telem_df)
+        spike_ms = float(telem_df.loc[spike_idx, "timestamp_ms"])
+        telemetry_start = lap_timestamps[0] - pd.Timedelta(milliseconds=spike_ms)
+        telem_df = align_telemetry(telem_df, gps_df, telemetry_start, time_offset_ms)
+
+        gps_laps, telem_laps = [], []
+        for i in range(len(lap_timestamps) - 1):
+            ls, le = lap_timestamps[i], lap_timestamps[i + 1]
+            gps_laps.append(
+                gps_df[(gps_df["time"] >= ls) & (gps_df["time"] < le)]
+                .copy().reset_index(drop=True)
+            )
+            telem_laps.append(
+                telem_df[(telem_df["time"] >= ls) & (telem_df["time"] < le)]
+                .copy().reset_index(drop=True)
+            )
+        return gps_laps, telem_laps, telem_df
+
+    telem_df = align_telemetry(telem_df, gps_df, start_time, time_offset_ms)
+
+    if split_method == "start":
+        spike_idx = find_start_spike(telem_df)
+        spike_time = telem_df.loc[spike_idx, "time"]
+        gps_start_idx = find_nearest_gps_index(gps_df, spike_time)
+        print(
+            f"Start spike at telemetry index {spike_idx}, time {spike_time}, "
+            f"matching GPS index {gps_start_idx}."
+        )
+        gps_df = gps_df.loc[gps_start_idx:].reset_index(drop=True)
+        boundaries = find_lap_boundaries_by_start_gate(gps_df, 0, laps)
+        if len(boundaries) < laps + 1:
+            print(
+                f"Warning: only found {len(boundaries) - 1} complete laps "
+                f"(wanted {laps}). Last segment will be appended."
+            )
+        gps_laps = []
+        for i in range(min(len(boundaries) - 1, laps)):
+            gps_laps.append(
+                gps_df.iloc[boundaries[i]: boundaries[i + 1]].reset_index(drop=True)
+            )
+        if len(gps_laps) < laps and boundaries:
+            gps_laps.append(gps_df.iloc[boundaries[-1]:].reset_index(drop=True))
+    else:
+        gps_laps = split_gps_into_laps(gps_df, laps, split_method)
+
+    telem_laps = []
+    for lap_gps in gps_laps:
+        if lap_gps.empty:
+            telem_laps.append(pd.DataFrame())
+            continue
+        ls = lap_gps["time"].iloc[0]
+        le = lap_gps["time"].iloc[-1]
+        telem_laps.append(
+            telem_df[
+                (telem_df["time"] >= ls - pd.Timedelta(seconds=tolerance_sec))
+                & (telem_df["time"] <= le + pd.Timedelta(seconds=tolerance_sec))
+            ].copy().reset_index(drop=True)
+        )
+
+    return gps_laps, telem_laps, telem_df
