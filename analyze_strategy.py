@@ -32,17 +32,11 @@ if _SCRIPT_DIR not in sys.path:
 
 from utsm_telemetry import (
     FORWARD_AXIS_CHOICES,
+    build_laps,
+    derive_motion_energy,
+    merge_by_time,
     read_gpx,
     read_telemetry,
-    align_telemetry,
-    find_start_spike,
-    find_nearest_gps_index,
-    find_lap_boundaries_by_start_gate,
-    split_gps_into_laps,
-    merge_by_time,
-    derive_motion_energy,
-    parse_lap_time,
-    parse_iso8601,
 )
 
 
@@ -79,144 +73,26 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--time-offset-ms", type=float, default=0.0,
-        help="Millisecond offset added to telemetry timestamps after alignment",
     )
     parser.add_argument(
         "--tolerance-sec", type=float, default=1.5,
-        help="Max seconds tolerance for GPS/telemetry time merge",
     )
     parser.add_argument(
         "--forward-axis",
         choices=FORWARD_AXIS_CHOICES,
         default="ax",
-        help=(
-            "Legacy IMU axis alias retained for older scripts."
-        ),
     )
-    parser.add_argument(
-        "--accel-window",
-        type=int,
-        default=5,
-        help="Legacy acceleration smoothing sample count retained for older scripts",
-    )
-    parser.add_argument(
-        "--accel-scale",
-        type=float,
-        default=1000.0,
-        help="Raw MPU accelerometer units per g. Afternoon data behaves like 1000.",
-    )
-    parser.add_argument(
-        "--imu-axis",
-        choices=["ax", "ay", "az"],
-        default="ax",
-        help="MPU axis used for the dashboard's selected dynamic acceleration channel.",
-    )
-    parser.add_argument(
-        "--imu-axis-sign",
-        type=int,
-        choices=[-1, 1],
-        default=1,
-        help="Sign applied to the selected MPU dynamic acceleration channel.",
-    )
-    parser.add_argument(
-        "--accel-bias-window-sec",
-        type=float,
-        default=30.0,
-        help="Centered rolling median window used to estimate slow MPU gravity/bias.",
-    )
-    parser.add_argument(
-        "--accel-smooth-window-sec",
-        type=float,
-        default=3.0,
-        help="Centered rolling median window used to smooth acceleration channels.",
-    )
+    parser.add_argument("--accel-window", type=int, default=5)
+    parser.add_argument("--accel-scale", type=float, default=1000.0)
+    parser.add_argument("--imu-axis", choices=["ax", "ay", "az"], default="ax")
+    parser.add_argument("--imu-axis-sign", type=int, choices=[-1, 1], default=1)
+    parser.add_argument("--accel-bias-window-sec", type=float, default=30.0)
+    parser.add_argument("--accel-smooth-window-sec", type=float, default=8.0)
     parser.add_argument(
         "--output-prefix", default="outputs/strategy",
-        help="Prefix for output files (e.g. outputs/run1_strategy)",
+        help="Prefix for output CSV and report files",
     )
     return parser.parse_args()
-
-
-# ---------------------------------------------------------------------------
-# Build laps (handles all split modes)
-# ---------------------------------------------------------------------------
-
-def build_laps(
-    gps_df: pd.DataFrame,
-    telem_df: pd.DataFrame,
-    args: argparse.Namespace,
-) -> tuple[list[pd.DataFrame], list[pd.DataFrame], pd.DataFrame]:
-    """Return (list_of_gps_lap_dfs, list_of_telem_lap_dfs, aligned_telem_df).
-
-    Mirrors the lap-building logic in gps_current_heatmap.py but returns
-    both sides of the merge so downstream functions can re-merge with
-    full energy channels.
-    """
-    if args.lap_times:
-        track_start = gps_df["time"].iloc[0]
-        lap_timestamps = [parse_lap_time(t, track_start) for t in args.lap_times]
-        if len(lap_timestamps) < 2:
-            raise ValueError("--lap-times requires at least 2 timestamps.")
-        spike_idx = find_start_spike(telem_df)
-        spike_ms = float(telem_df.loc[spike_idx, "timestamp_ms"])
-        telemetry_start = lap_timestamps[0] - pd.Timedelta(milliseconds=spike_ms)
-        telem_df = align_telemetry(telem_df, gps_df, telemetry_start, args.time_offset_ms)
-
-        gps_laps, telem_laps = [], []
-        for i in range(len(lap_timestamps) - 1):
-            ls, le = lap_timestamps[i], lap_timestamps[i + 1]
-            gps_laps.append(
-                gps_df[(gps_df["time"] >= ls) & (gps_df["time"] < le)]
-                .copy().reset_index(drop=True)
-            )
-            telem_laps.append(
-                telem_df[(telem_df["time"] >= ls) & (telem_df["time"] < le)]
-                .copy().reset_index(drop=True)
-            )
-        return gps_laps, telem_laps, telem_df
-
-    telem_df = align_telemetry(telem_df, gps_df, args.start_time, args.time_offset_ms)
-
-    if args.split_method == "start":
-        spike_idx = find_start_spike(telem_df)
-        start_time = telem_df.loc[spike_idx, "time"]
-        gps_start_idx = find_nearest_gps_index(gps_df, start_time)
-        print(
-            f"Start spike at telemetry index {spike_idx}, time {start_time}, "
-            f"matching GPS index {gps_start_idx}."
-        )
-        gps_df = gps_df.loc[gps_start_idx:].reset_index(drop=True)
-        boundaries = find_lap_boundaries_by_start_gate(gps_df, 0, args.laps)
-        if len(boundaries) < args.laps + 1:
-            print(
-                f"Warning: only found {len(boundaries) - 1} complete laps "
-                f"(wanted {args.laps}). Last segment will be appended."
-            )
-        gps_laps = []
-        for i in range(min(len(boundaries) - 1, args.laps)):
-            gps_laps.append(
-                gps_df.iloc[boundaries[i]: boundaries[i + 1]].reset_index(drop=True)
-            )
-        if len(gps_laps) < args.laps and boundaries:
-            gps_laps.append(gps_df.iloc[boundaries[-1]:].reset_index(drop=True))
-    else:
-        gps_laps = split_gps_into_laps(gps_df, args.laps, args.split_method)
-
-    telem_laps = []
-    for lap_gps in gps_laps:
-        if lap_gps.empty:
-            telem_laps.append(pd.DataFrame())
-            continue
-        ls = lap_gps["time"].iloc[0]
-        le = lap_gps["time"].iloc[-1]
-        telem_laps.append(
-            telem_df[
-                (telem_df["time"] >= ls - pd.Timedelta(seconds=args.tolerance_sec))
-                & (telem_df["time"] <= le + pd.Timedelta(seconds=args.tolerance_sec))
-            ].copy().reset_index(drop=True)
-        )
-
-    return gps_laps, telem_laps, telem_df
 
 
 # ---------------------------------------------------------------------------
@@ -244,24 +120,12 @@ def build_lap_summary(lap_merged: pd.DataFrame, lap_num: int) -> dict:
         "avg_power_w": float(lap_merged["power_w"].mean()),
         "total_energy_wh": total_energy,
         "efficiency_wh_per_km": efficiency,
-        "avg_gps_accel_m_s2": float(
-            lap_merged["gps_longitudinal_accel_m_s2"].mean()
-        ),
-        "max_gps_accel_m_s2": float(
-            lap_merged["gps_longitudinal_accel_m_s2"].max()
-        ),
-        "min_gps_accel_m_s2": float(
-            lap_merged["gps_longitudinal_accel_m_s2"].min()
-        ),
-        "avg_imu_dynamic_accel_m_s2": float(
-            lap_merged["imu_forward_dynamic_m_s2"].mean()
-        ),
-        "max_imu_dynamic_accel_m_s2": float(
-            lap_merged["imu_forward_dynamic_m_s2"].max()
-        ),
-        "min_imu_dynamic_accel_m_s2": float(
-            lap_merged["imu_forward_dynamic_m_s2"].min()
-        ),
+        "avg_gps_accel_m_s2": float(lap_merged["gps_longitudinal_accel_m_s2"].mean()),
+        "max_gps_accel_m_s2": float(lap_merged["gps_longitudinal_accel_m_s2"].max()),
+        "min_gps_accel_m_s2": float(lap_merged["gps_longitudinal_accel_m_s2"].min()),
+        "avg_imu_dynamic_accel_m_s2": float(lap_merged["imu_forward_dynamic_m_s2"].mean()),
+        "max_imu_dynamic_accel_m_s2": float(lap_merged["imu_forward_dynamic_m_s2"].max()),
+        "min_imu_dynamic_accel_m_s2": float(lap_merged["imu_forward_dynamic_m_s2"].min()),
         "max_jerk_m_s3": float(lap_merged["jerk_m_s3"].max()),
         "min_jerk_m_s3": float(lap_merged["jerk_m_s3"].min()),
         "elev_gain_m": elev_pos,
@@ -299,24 +163,12 @@ def build_sector_summary(lap_merged: pd.DataFrame, lap_num: int, n_segments: int
             "avg_power_w": float(seg["power_w"].mean()),
             "avg_current_mA": float(seg["current_mA"].mean()),
             "max_current_mA": float(seg["current_mA"].max()),
-            "avg_gps_accel_m_s2": float(
-                seg["gps_longitudinal_accel_m_s2"].mean()
-            ),
-            "max_gps_accel_m_s2": float(
-                seg["gps_longitudinal_accel_m_s2"].max()
-            ),
-            "min_gps_accel_m_s2": float(
-                seg["gps_longitudinal_accel_m_s2"].min()
-            ),
-            "avg_imu_dynamic_accel_m_s2": float(
-                seg["imu_forward_dynamic_m_s2"].mean()
-            ),
-            "max_imu_dynamic_accel_m_s2": float(
-                seg["imu_forward_dynamic_m_s2"].max()
-            ),
-            "min_imu_dynamic_accel_m_s2": float(
-                seg["imu_forward_dynamic_m_s2"].min()
-            ),
+            "avg_gps_accel_m_s2": float(seg["gps_longitudinal_accel_m_s2"].mean()),
+            "max_gps_accel_m_s2": float(seg["gps_longitudinal_accel_m_s2"].max()),
+            "min_gps_accel_m_s2": float(seg["gps_longitudinal_accel_m_s2"].min()),
+            "avg_imu_dynamic_accel_m_s2": float(seg["imu_forward_dynamic_m_s2"].mean()),
+            "max_imu_dynamic_accel_m_s2": float(seg["imu_forward_dynamic_m_s2"].max()),
+            "min_imu_dynamic_accel_m_s2": float(seg["imu_forward_dynamic_m_s2"].min()),
             "max_jerk_m_s3": float(seg["jerk_m_s3"].max()),
             "min_jerk_m_s3": float(seg["jerk_m_s3"].min()),
             "energy_wh": energy,
@@ -371,7 +223,6 @@ def generate_findings(
 ) -> str:
     lines = ["=== Strategy Findings ===", ""]
 
-    # Identify "full laps" as those within 90% of median lap distance
     median_dist = laps_df["distance_m"].median()
     full = laps_df[laps_df["distance_m"] >= 0.9 * median_dist]
 
@@ -403,7 +254,6 @@ def generate_findings(
 
     lines.append("")
 
-    # Speed bin findings
     if not speed_bins_df.empty:
         valid = speed_bins_df.dropna(subset=["efficiency_wh_per_km"])
         if not valid.empty:
@@ -421,7 +271,6 @@ def generate_findings(
             )
             lines.append("")
 
-    # Sector improvements between the last two full laps
     full_lap_nums = sorted(full["lap"].tolist())
     if len(full_lap_nums) >= 2:
         last_two = full_lap_nums[-2:]
@@ -462,7 +311,6 @@ def generate_findings(
 def main() -> int:
     args = parse_args()
 
-    # Ensure output directory exists
     out_dir = os.path.dirname(args.output_prefix)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
@@ -473,7 +321,16 @@ def main() -> int:
     telem_df = read_telemetry(args.telemetry)
 
     print("Building laps...")
-    gps_laps, telem_laps, telem_aligned = build_laps(gps_df, telem_df, args)
+    gps_laps, telem_laps, _telem_aligned = build_laps(
+        gps_df,
+        telem_df,
+        laps=args.laps,
+        split_method=args.split_method,
+        start_time=args.start_time,
+        time_offset_ms=args.time_offset_ms,
+        tolerance_sec=args.tolerance_sec,
+        lap_times=args.lap_times,
+    )
 
     lap_summaries = []
     sector_rows = []
@@ -524,7 +381,6 @@ def main() -> int:
     speed_bins = build_speed_bins(all_derived)
     speed_bins_df = pd.DataFrame(speed_bins)
 
-    # Write CSVs
     laps_csv = args.output_prefix + "_laps.csv"
     sectors_csv = args.output_prefix + "_sectors.csv"
     bins_csv = args.output_prefix + "_speed_bins.csv"
@@ -535,7 +391,6 @@ def main() -> int:
     speed_bins_df.to_csv(bins_csv, index=False)
     print(f"Wrote: {laps_csv}, {sectors_csv}, {bins_csv}")
 
-    # Write plain-English report
     report = generate_findings(laps_df, sectors_df, speed_bins_df)
     with open(report_txt, "w") as fh:
         fh.write(report + "\n")
