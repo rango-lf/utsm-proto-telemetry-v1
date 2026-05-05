@@ -1,6 +1,6 @@
 # UTSM Proto Telemetry, Analysis, and Simulation Project
 
-Python tools for capturing, analysing, and visualising SEMA telemetry data. The pipeline takes two inputs: a **GPX track file** from Strava/Garmin and a **telemetry CSV** from the car's on-board computer, and produces lap summaries, efficiency reports, strategy recommendations, and an interactive HTML dashboard.
+These are some Python tools for capturing, analysing, and visualising SEMA telemetry data. The pipeline takes two inputs: a **GPX track file** from Strava/Garmin and a **telemetry CSV** from the car's on-board computer, and produces lap summaries, efficiency reports, strategy recommendations, and an interactive HTML dashboard.
 
 **Primary Contributors:** Brayden Chan Carusone, Rango Lee-Fu
 
@@ -116,7 +116,7 @@ The two April 11 telemetry files are already included in `telemetry_dumps/`.
 
 ## Typical workflow
 
-**After a test**, run these four commands in order. The first two generate analysis reports; the third builds the interactive dashboard; the fourth produces per-lap heatmap images.
+After a test, you should run these four commands in order. The first two generate analysis reports, the third builds the interactive dashboard, then the fourth produces per-lap heatmap images.
 
 ```powershell
 # 1. Lap reports and efficiency analysis
